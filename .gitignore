@@ -1,5 +1,5 @@
 .Rhistory
 *.Rproj
 *.html
-*.Rmd
 *.Rproj.user
+.Rproj.user

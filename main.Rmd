@@ -1,0 +1,297 @@
+---
+title: "Hands-on"
+author: "Daniel Amaral"
+output: html_notebook
+---
+
+## Introdução
+
+O Código abaixo objetiva a modelagem da classificação de sementes em um conjunto de dados, obtido do repositório da UCI Machine Learning.
+
+O link para a página do dataset, assim como mais informações sobre o mesmo, é dado no link abaixo:
+
+https://archive.ics.uci.edu/ml/datasets/seeds
+
+Para modelagem do conjunto de dados acima, vamos utilizar um modelo de vizinhos mais próximos com grid search e um modelo de redes neurais (mlp) com otimização bayesiana.
+
+As métricas a serem avaliadas serão a acurácia, precisão, sensibilidade, especifidade, AUC, kappa e recall.
+
+## Bibliotecas
+
+```{r message = FALSE, warning = FALSE}
+library(tidyverse)
+library(tidymodels)
+```
+
+## Dados
+
+```{r message = FALSE, warning = FALSE}
+seeds <- read_csv('data/seed_data.csv')
+```
+
+## Separação em Treino/Teste
+
+Separação dos Dados na proporção 70/30 (Treino/Teste), estratificado pelo tipo de semente (target).
+
+```{r message = FALSE, warning = FALSE}
+set.seed(123)
+
+seeds_split <- initial_split(seeds, strata = target, prop = 0.7)
+seeds_train <- training(seeds_split)
+seeds_test <- testing(seeds_split)
+```
+
+## Validação Cruzada
+
+Criação do Conjunto de Validação com 5 Folds (Partições), estratificado pelo tipo de semente (target).
+
+```{r message = FALSE, warning = FALSE}
+cv_folds <- vfold_cv(seeds_train, v = 5, strata = target)
+```
+
+## Análise Exploratória
+
+Antes do pré processamento, precisamos entender como o nosso dataset está.
+
+Primeiro uma olhada nas estatísticas basicas gerais:
+
+```{r}
+library(skimr) # Pacote Útil para Estatísticas Básicas
+
+seeds_train %>%
+  skim
+```
+
+Pela análise das estatísticas básicas, temos dois problemas a serem solucionados:
+
+- algumas variáveis estão em escalas diferentes;
+- a variável de interesse (target) está como numérica, mas ela é naturalmente categórica.
+
+Vamos avaliar tambem as correlações entre preditores (não considerando a saída)
+
+```{r}
+library(corrplot) # Pacote Útil para Plots com Correlação
+
+seeds_train %>%
+  select(-target) %>%
+  cor %>%
+  corrplot(type = 'upper', diag = FALSE,
+           method = 'number')
+```
+
+Perceba que temos alguns pares de variáveis com alta correlação entre sí... Isso é um problema, já que basicamente as variáveis no dão a mesma informação. Alguns modelos são bastantes sensíveis a esse problema, chamado de multicolinearidade.
+
+Bom... por enquanto esses são os problemas para corrigirmos.
+
+## Pré processamento
+
+Vamos corrigir os problemas anteriores:
+
+```{r}
+seeds_rec <- recipe(target ~ ., data = seeds_train) %>%
+  step_range(all_numeric_predictors(), min = 0, max = 1) %>% # Normalização Min-Max
+  step_corr(all_numeric_predictors(), threshold = 0.9) %>% # Filtro de Correlação (Corte Acima de 0.90)
+  step_num2factor(all_outcomes(), levels = c('Kama', 'Rosa', 'Canadian')) # Saída Numérica para Categórica
+```
+
+Caso queira dar uma olhada em como o dataset está, é só da um "prep" e "juice" na receita:
+
+```{r}
+seeds_rec %>%
+  prep %>% 
+  juice
+```
+
+Perceba que o recipes cortou 3 variáveis redundantes (segundo o nosso critério de correlação).
+
+## Especificação do Modelo
+
+Vamos especificar a estrutura dos modelos de vizinhos mais próximos (knn) e de redes neurais (mlp):
+
+```{r}
+knn_spec <- nearest_neighbor(neighbors = tune(), weight_func = tune(), 
+                             dist_power = tune()) %>%
+  set_engine("kknn") %>% 
+  set_mode("classification") 
+
+nnet_spec <- mlp(epochs = tune(), hidden_units = tune(), 
+                 penalty = tune()) %>%
+  set_engine("nnet") %>%
+  set_mode("classification")
+```
+
+## Definição do Workflow
+
+Agora a definição do workflow, partindo da adição da receita de pré-processamento e a especificação do modelo.
+
+```{r}
+knn_wflow <- workflow() %>%
+  add_recipe(seeds_rec) %>%
+  add_model(knn_spec)
+
+nnet_wflow <- workflow() %>%
+  add_recipe(seeds_rec) %>%
+  add_model(nnet_spec)
+```
+
+## Ajuste e Tuning de Parâmetros
+
+Aqui definimos os controles para o modelo knn com grid search (control_grid) e para o modelo nnet com otimização bayesiana (control_bayes).
+
+```{r}
+model_control_knn <- control_grid(save_pred = TRUE, verbose = TRUE)
+model_control_nnet <- control_bayes(save_pred = TRUE, verbose = TRUE)
+model_metrics <- metric_set(accuracy, precision, sens, spec, roc_auc, kap, recall)
+```
+
+## Processamento Paralelo
+
+Essa é uma etapa opcional, caso seu processador tenha disponibilidade de cores, o código abaixo possibilita que o processamento paralelo seja utilizado pelo tidymodels. Dessa forma, os modelos serão ajustados de forma paralela (vários ao mesmo tempo)... Maas, já aviso que o desempenho do computador para outras tarefas será comprometido nessa etapa. 
+
+```{r}
+library(parallel)
+library(doParallel)
+
+cl <- makeCluster(4)
+registerDoParallel(cl)
+```
+
+## Ajuste dos Modelos
+
+Aqui os modelos serão ajustados...
+
+Para o modelo knn, por estar utilizando a tunagem via busca em grade, precisamos definir o "range" de busca dos hiper-parâmetros do modelo.
+
+```{r}
+knn_grid <- expand.grid(neighbors = 1:20, 
+                        weight_func = c('optimal', 'cos', 'gaussian'), 
+                        dist_power = 1:3)
+knn_fit <- knn_wflow %>% 
+  tune_grid(resamples = cv_folds, metrics = model_metrics, 
+            control = model_control_knn, grid = knn_grid)
+
+nnet_fit <- nnet_wflow %>% 
+  tune_bayes(resamples = cv_folds, metrics = model_metrics, 
+             initial = 5, iter = 50, control = model_control_nnet)
+```
+
+## Visualização das Métricas
+
+A visualização de métricas pode ser feita através da função collect_metrics, mas para melhor visualizar métricas específicas, a função filter pode ser bem utilizada.
+
+```{r}
+knn_fit %>%
+  collect_metrics() %>%
+  filter(.metric == 'accuracy')
+
+nnet_fit %>%
+  collect_metrics() %>%
+  filter(.metric == 'accuracy')
+```
+
+## Extração dos Melhores Modelos
+
+A extração dos melhores modelos é bastante simples, se deseja extrair os hiperparâmetros do melhor modelo, dado uma métrica, utilize a função select_best('accuracy'), por exemplo para selecionar o melhor modelo baseado na métrica de acurácia...
+
+Caso queira extrair os hiperparâmetros do melhor modelo, utilizando a métrica padrão (primeira métrica do model_metrics), utilize somente a função select_best().
+
+Após, finalize o workflow com o melhor modelo utilizando a função finalize_workflow com o melhor parâmetro. 
+
+```{r warning=FALSE}
+best_par_knn <- knn_fit %>%
+  select_best()
+knn_wflow <- knn_wflow %>%
+  finalize_workflow(best_par_knn)
+
+best_par_nnet <- nnet_fit %>%
+  select_best()
+nnet_wflow <- nnet_wflow %>%
+  finalize_workflow(best_par_nnet)
+```
+
+## Ajustando os Modelos no Conjunto Inteiro de Treino e Predizendo no Conjunto de Teste
+
+O Processo de ajuste nos dados completos de treino e aplicação nos dados de teste é bem simples, precisando somente chamar a função last_fit no workflow do modelo em questão e na variável de divisão dos dados.
+
+```{r}
+knn_fit_final <- knn_wflow %>%
+  last_fit(seeds_split)
+
+nnet_fit_final <- nnet_wflow %>%
+  last_fit(seeds_split)
+```
+
+## Teste dos Modelos
+
+### Métricas
+
+```{r}
+knn_fit_final %>%
+  collect_predictions() %>%
+  model_metrics(truth = target, 
+                estimate = .pred_class, 
+                .pred_Kama:.pred_Canadian)
+
+nnet_fit_final %>%
+  collect_predictions() %>%
+  model_metrics(truth = target, 
+                estimate = .pred_class, 
+                .pred_Kama:.pred_Canadian)
+```
+
+
+### Curva ROC
+
+```{r}
+knn_fit_final %>%
+  collect_predictions() %>% 
+  roc_curve(target, .pred_Kama:.pred_Canadian) %>% 
+  autoplot()
+
+nnet_fit_final %>%
+  collect_predictions() %>% 
+  roc_curve(target, .pred_Kama:.pred_Canadian) %>% 
+  autoplot()
+```
+
+### Matriz de Confusão
+
+```{r}
+knn_fit_final %>%
+  collect_predictions() %>%
+  conf_mat(target, .pred_class)
+
+nnet_fit_final %>%
+  collect_predictions() %>%
+  conf_mat(target, .pred_class)
+```
+
+### "Criatividade"
+
+Vou criar um simples exemplo de utilização de ferramentas do tidyverse para colocar a curva ROC para comparar os dois modelos:
+
+```{r}
+knn_auc <- knn_fit_final %>% 
+  collect_predictions() %>% 
+  roc_curve(target, .pred_Kama:.pred_Canadian) %>% 
+  mutate(model = "kNN")
+
+nnet_auc <- nnet_fit_final %>% 
+  collect_predictions() %>% 
+  roc_curve(target, .pred_Kama:.pred_Canadian) %>% 
+  mutate(model = "nnet")
+```
+
+No código acima são coletadas as predições, calculados os valores de sensibilidade e sensitividade, e por fim criada uma variável constante apenas para identificar qual o tipo do modelo.
+
+Abaixo, uno os dois conjuntos de dados e monto a curva ROC, utilizando o recurso de facet_wrap do ggplot2 para separar os gráficos pelas classes da variável de saída.
+
+```{r}
+bind_rows(knn_auc, nnet_auc) %>% 
+  ggplot(aes(x = 1 - specificity, y = sensitivity, col = model)) + # Definição da Curva ROC
+  geom_path(lwd = 1, alpha = 0.8) + # Estilo das Linhas
+  geom_abline(lty = 3) +  # Linha Diagonal
+  coord_equal() + # Padrão Visual das Coordenadas X e Y
+  facet_wrap(~ .level) + # Divisão dos Gráficos para cada Nível da Saída
+  scale_color_viridis_d(option = "plasma", end = .6) # Paleta de Cores
+```
